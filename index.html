@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>WebRTC 1-to-1 Test</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
+    h1{font-size:18px;margin:12px 0}.row{display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+    input{flex:1;min-width:140px;padding:12px;font-size:16px;border-radius:8px;border:1px solid #444;background:#222;color:#fff}
+    button{padding:12px 14px;font-size:15px;border:0;border-radius:8px;background:#2f6fed;color:#fff}
+    button.secondary{background:#444}button.danger{background:#d13b3b}button:disabled{opacity:.4}
+    #status{font-size:14px;padding:8px 0;color:#9fd}.videos{position:relative;width:100%;max-width:640px;margin:8px auto}
+    #remoteVideo{width:100%;aspect-ratio:3/4;max-height:65vh;background:#000;border-radius:12px;object-fit:cover}
+    #localVideo{position:absolute;right:8px;bottom:8px;width:28%;aspect-ratio:3/4;object-fit:cover;border-radius:8px;border:2px solid #fff;background:#222}
+    #log{font:12px/1.4 monospace;background:#1a1a1a;padding:8px;border-radius:8px;max-height:160px;overflow:auto;white-space:pre-wrap}
+  </style>
+</head>
+<body>
+<h1>WebRTC 1-to-1 Video Call Test</h1>
+<div class="row"><input id="roomInput" placeholder="Room ID (e.g. test123)" autocapitalize="off" autocomplete="off"><button id="randomBtn" class="secondary">Random</button></div>
+<div class="row"><button id="joinBtn">Join</button><button id="leaveBtn" class="danger" disabled>Leave</button><button id="micBtn" class="secondary" disabled>Mute</button><button id="camBtn" class="secondary" disabled>Cam off</button><button id="copyBtn" class="secondary">Copy link</button></div>
+<div id="status">Not connected.</div>
+<div class="videos"><video id="remoteVideo" autoplay playsinline></video><video id="localVideo" autoplay playsinline muted></video></div>
+<div id="log"></div>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $=id=>document.getElementById(id),roomInput=$('roomInput'),joinBtn=$('joinBtn'),leaveBtn=$('leaveBtn'),micBtn=$('micBtn'),camBtn=$('camBtn'),localVideo=$('localVideo'),remoteVideo=$('remoteVideo');
+const socket=io();let pc=null,localStream=null,currentRoom=null,pendingCandidates=[],iceServers=[{urls:'stun:stun.l.google.com:19302'}];
+function log(msg){const line=`[${new Date().toLocaleTimeString()}] ${msg}`;$('log').textContent+=line+'\n';$('log').scrollTop=$('log').scrollHeight;console.log(msg)}
+function setStatus(msg){$('status').textContent=msg}
+const urlRoom=new URLSearchParams(location.search).get('room');if(urlRoom)roomInput.value=urlRoom;
+$('randomBtn').onclick=()=>roomInput.value=Math.random().toString(36).slice(2,8);
+$('copyBtn').onclick=async()=>{const room=roomInput.value.trim();if(!room)return alert('Enter a room ID first.');const link=`${location.origin}/?room=${encodeURIComponent(room)}`;try{await navigator.clipboard.writeText(link);log('Link copied: '+link)}catch{prompt('Copy this link:',link)}};
+async function loadIceConfig(){try{const res=await fetch('/ice-config');const data=await res.json();if(Array.isArray(data.iceServers))iceServers=data.iceServers;log('ICE servers loaded: '+iceServers.length+' entry(ies)')}catch(e){log('Could not load /ice-config, using default STUN.')}}
+async function getMedia(){if(localStream)return localStream;localStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}},audio:true});localVideo.srcObject=localStream;return localStream}
+function closePeer(){if(pc){pc.ontrack=pc.onicecandidate=pc.onconnectionstatechange=null;pc.close();pc=null}pendingCandidates=[];remoteVideo.srcObject=null}
+function createPeer(){closePeer();pc=new RTCPeerConnection({iceServers});localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+pc.ontrack=e=>{log('Remote track received: '+e.track.kind);remoteVideo.srcObject=e.streams[0];remoteVideo.play().catch(()=>{})};
+pc.onicecandidate=e=>{if(e.candidate)socket.emit('ice-candidate',{candidate:e.candidate})};
+pc.onconnectionstatechange=()=>{log('Connection state: '+pc.connectionState);if(pc.connectionState==='connected')setStatus('In call (connected).');if(pc.connectionState==='failed')setStatus('Connection failed. A TURN server may be needed.')};return pc}
+async function flushCandidates(){for(const c of pendingCandidates){try{await pc.addIceCandidate(c)}catch(e){log('addIceCandidate error: '+e.message)}}pendingCandidates=[]}
+socket.on('connect',()=>{log('Socket connected: '+socket.id);if(currentRoom)doJoin(currentRoom)});
+socket.on('disconnect',reason=>{log('Socket disconnected: '+reason);setStatus('Signaling disconnected, reconnecting...')});
+socket.on('peer-joined',async()=>{log('Peer joined. Creating offer...');setStatus('Peer joined. Connecting...');try{createPeer();const offer=await pc.createOffer();await pc.setLocalDescription(offer);socket.emit('offer',{sdp:pc.localDescription})}catch(e){log('Offer error: '+e.message)}});
+socket.on('offer',async({sdp})=>{log('Offer received. Creating answer...');try{createPeer();await pc.setRemoteDescription(sdp);await flushCandidates();const answer=await pc.createAnswer();await pc.setLocalDescription(answer);socket.emit('answer',{sdp:pc.localDescription})}catch(e){log('Answer error: '+e.message)}});
+socket.on('answer',async({sdp})=>{log('Answer received.');try{if(!pc)return;await pc.setRemoteDescription(sdp);await flushCandidates()}catch(e){log('setRemoteDescription error: '+e.message)}});
+socket.on('ice-candidate',async({candidate})=>{if(!candidate)return;if(pc&&pc.remoteDescription){try{await pc.addIceCandidate(candidate)}catch(e){log('addIceCandidate error: '+e.message)}}else pendingCandidates.push(candidate)});
+socket.on('peer-left',()=>{log('Peer left.');closePeer();setStatus('Other person left. Waiting for someone to join...')});
+function doJoin(room){socket.emit('join-room',{roomId:room},res=>{if(!res.ok){log('Join failed: '+res.error);setStatus(res.error);currentRoom=null;resetButtons();return}currentRoom=res.roomId;log(`Joined room "${res.roomId}". Others present: ${res.peers.length}`);setStatus(res.peers.length?'Joined. Waiting for the connection...':'Waiting for the other person to join...');joinBtn.disabled=true;leaveBtn.disabled=false;micBtn.disabled=false;camBtn.disabled=false})}
+function resetButtons(){joinBtn.disabled=false;leaveBtn.disabled=true;micBtn.disabled=true;camBtn.disabled=true}
+joinBtn.onclick=async()=>{const room=roomInput.value.trim();if(!room)return alert('Enter a room ID.');joinBtn.disabled=true;try{await loadIceConfig();await getMedia()}catch(e){log('Camera/mic error: '+e.message);setStatus('Could not access camera/mic. Allow permission and use HTTPS.');joinBtn.disabled=false;return}doJoin(room)};
+leaveBtn.onclick=()=>{socket.emit('leave-room');currentRoom=null;closePeer();if(localStream){localStream.getTracks().forEach(t=>t.stop());localStream=null;localVideo.srcObject=null}resetButtons();micBtn.textContent='Mute';camBtn.textContent='Cam off';setStatus('Left the room.');log('Left room.')};
+micBtn.onclick=()=>{if(!localStream)return;const track=localStream.getAudioTracks()[0];track.enabled=!track.enabled;micBtn.textContent=track.enabled?'Mute':'Unmute'};
+camBtn.onclick=()=>{if(!localStream)return;const track=localStream.getVideoTracks()[0];track.enabled=!track.enabled;camBtn.textContent=track.enabled?'Cam off':'Cam on'};
+</script></body></html>
